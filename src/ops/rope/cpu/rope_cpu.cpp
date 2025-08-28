@@ -1,50 +1,51 @@
 #include "rope_cpu.hpp"
 #include "../../../utils.hpp"
 
-#include <cmath> // std::powf, std::cosf, std::sinf
+#include <cmath>
 #include <vector>
 
 namespace {
 
+// Use double inside for stability, then cast to T on store.
 template <typename T>
 inline void rope_impl(T *out,
                       const T *in,
-                      const int64_t *pos,
+                      const int64_t *pos_ids,
                       size_t seqlen, size_t nhead, size_t d,
                       float theta_f) {
-    const size_t half = d / 2;
+    // d must be even
+    ASSERT(d % 2 == 0, "RoPE: head dimension must be even.");
+    const size_t dh = d / 2;
+
     const double theta = static_cast<double>(theta_f);
 
-    // inv_freq[j] = theta^{-(2j/d)}
-    std::vector<double> inv_freq(half);
-    const double denom = static_cast<double>(half);// d/2
-    for (size_t j = 0; j < half; ++j) {
-        const double exp = -static_cast<double>(j) / denom;
-        inv_freq[j] = std::pow(theta, exp);
-        //  1.0f / std::pow(theta, 2.0f*j/d)
+    // inv_freq[i] = 1.0 / pow(theta, i/(d/2))   (use double for stability)
+    std::vector<double> inv_freq(dh);
+    for (size_t i = 0; i < dh; ++i) {
+        inv_freq[i] = 1.0 / std::pow(theta, static_cast<double>(i) / static_cast<double>(dh));
     }
 
-    // layout: contiguous row-major
-    // vector offset step per (i,h): d elements
-    for (size_t i = 0; i < seqlen; ++i) {
-        const double p = static_cast<double>(pos[i]);
+    for (size_t t = 0; t < seqlen; ++t) {
+        const double p = static_cast<double>(pos_ids[t]);
         for (size_t h = 0; h < nhead; ++h) {
-            const T *src = in + (i * nhead + h) * d;
-            T *dst = out + (i * nhead + h) * d;
+            const T *src = in + (t * nhead + h) * d;
+            T *dst = out + (t * nhead + h) * d;
 
-            for (size_t j = 0; j < half; ++j) {
-                const double a = static_cast<double>(llaisys::utils::cast<float>(src[j]));
-                const double b = static_cast<double>(llaisys::utils::cast<float>(src[j + half]));
+            // split [a | b], each length dh
+            for (size_t i = 0; i < dh; ++i) {
+                // read as float, compute in double
+                const double a = static_cast<double>(llaisys::utils::cast<float>(src[i]));
+                const double b = static_cast<double>(llaisys::utils::cast<float>(src[i + dh]));
 
-                const double angle = p * inv_freq[j];
-                const double c = std::cos(angle);
-                const double s = std::sin(angle);
+                const double phi = p * inv_freq[i];
+                const double c = std::cos(phi);
+                const double s = std::sin(phi);
 
                 const double ap = a * c - b * s;
                 const double bp = b * c + a * s;
 
-                dst[j] = llaisys::utils::cast<T>(static_cast<float>(ap));
-                dst[j + half] = llaisys::utils::cast<T>(static_cast<float>(bp));
+                dst[i] = llaisys::utils::cast<T>(static_cast<float>(ap));
+                dst[i + dh] = llaisys::utils::cast<T>(static_cast<float>(bp));
             }
         }
     }
@@ -60,8 +61,7 @@ void rope(std::byte *out,
           llaisysDataType_t type,
           size_t seqlen, size_t nhead, size_t d,
           float theta) {
-    const size_t half = d / 2;
-    ASSERT(d % 2 == 0 && half > 0, "rope: last dimension d must be even and > 0");
+    ASSERT(d % 2 == 0 && d >= 2, "RoPE: last dimension must be even and >= 2");
 
     switch (type) {
     case LLAISYS_DTYPE_F32:
