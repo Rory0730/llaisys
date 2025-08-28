@@ -29,9 +29,10 @@ class Qwen2:
         meta.voc     = int(cfg["vocab_size"])
         meta.epsilon = float(cfg.get("rms_norm_eps", 1e-6))
         meta.theta   = float(cfg.get("rope_theta", 10000.0))
-        meta.end_token = int(cfg.get("eos_token_id", 2))
+        meta.end_token = int(cfg.get("eos_token_id", 151643))
 
         self._handle = LIB_LLAISYS.llaisysQwen2ModelCreate(meta, int(device), None, 0)
+        self._eos = int(meta.end_token)
 
         # numpy 路径支持的 dtype 映射
         NP_DTYPE_TO_LLA = {
@@ -114,7 +115,8 @@ class Qwen2:
             nxt = LIB_LLAISYS.llaisysQwen2ModelInfer(self._handle, buf, len(ids))
             ids.append(int(nxt))
             # optional early stop:
-            # if nxt == self.eos_id: break
+            if nxt == self._eos:
+                break
         return ids  # <- full sequence
 
     def __del__(self):

@@ -162,6 +162,11 @@ inline tensor_t as_qkv_3d(const tensor_t &x2d, size_t H, size_t D) {
     return x2d->view({x2d->shape()[0], H, D});
 }
 
+inline tensor_t getWOrNull(Model *M, const std::string &name) {
+    auto it = M->W.find(name);
+    return (it == M->W.end()) ? tensor_t{} : it->second;
+}
+
 // Run one token through the whole stack, append K/V into cache, and return next id.
 static int64_t step_decode_one(Model &M, int64_t token_id, size_t pos_idx) {
     const auto &meta = M.meta;
@@ -179,9 +184,25 @@ static int64_t step_decode_one(Model &M, int64_t token_id, size_t pos_idx) {
         llaisys::ops::rms_norm(M.h1, M.x1, ln, meta.epsilon);
 
         // Q, K, V projections
-        llaisys::ops::linear(M.q2, M.h1, getW(&M, "model.layers." + std::to_string(l) + ".self_attn.q_proj.weight"), nullptr);
-        llaisys::ops::linear(M.k2, M.h1, getW(&M, "model.layers." + std::to_string(l) + ".self_attn.k_proj.weight"), nullptr);
-        llaisys::ops::linear(M.v2, M.h1, getW(&M, "model.layers." + std::to_string(l) + ".self_attn.v_proj.weight"), nullptr);
+        auto base = "model.layers." + std::to_string(l) + ".self_attn.";
+
+        // Q = X W_q^T + b_q
+        llaisys::ops::linear(
+            M.q2, M.h1,
+            getW(&M, base + "q_proj.weight"),
+            getWOrNull(&M, base + "q_proj.bias"));
+
+        // K = X W_k^T + b_k
+        llaisys::ops::linear(
+            M.k2, M.h1,
+            getW(&M, base + "k_proj.weight"),
+            getWOrNull(&M, base + "k_proj.bias"));
+
+        // V = X W_v^T + b_v
+        llaisys::ops::linear(
+            M.v2, M.h1,
+            getW(&M, base + "v_proj.weight"),
+            getWOrNull(&M, base + "v_proj.bias"));
 
         M.Q = as_qkv_3d(M.q2, meta.nh, meta.dh);
         M.K = as_qkv_3d(M.k2, meta.nkvh, meta.dh);
@@ -196,20 +217,18 @@ static int64_t step_decode_one(Model &M, int64_t token_id, size_t pos_idx) {
         // Write this token's K/V into cache row pos_idx
         auto K_row = M.cache[l].K->slice(0, pos_idx, pos_idx + 1); // [1, nkvh, dh]
         auto V_row = M.cache[l].V->slice(0, pos_idx, pos_idx + 1); // [1, nkvh, dh]
-        /*llaisys::ops::rearrange(K_row, M.Kr);
-        llaisys::ops::rearrange(V_row, M.V);*/
-         if (K_row->isContiguous() && M.Kr->isContiguous()) {
-             const size_t bytes = K_row->numel() * K_row->elementSize();
-             std::memcpy(K_row->data(), M.Kr->data(), bytes);
-         } else {
-             llaisys::ops::rearrange(K_row, M.Kr);
-         }
-         if (V_row->isContiguous() && M.V->isContiguous()) {
-             const size_t bytes = V_row->numel() * V_row->elementSize();
-             std::memcpy(V_row->data(), M.V->data(), bytes);
-         } else {
-             llaisys::ops::rearrange(V_row, M.V);
-         }
+
+        if (K_row->isContiguous() && M.Kr->isContiguous()) {
+            std::memcpy(K_row->data(), M.Kr->data(), K_row->numel() * K_row->elementSize());
+        } else {
+            llaisys::ops::rearrange(K_row, M.Kr);
+        }
+        if (V_row->isContiguous() && M.V->isContiguous()) {
+            std::memcpy(V_row->data(), M.V->data(), V_row->numel() * V_row->elementSize());
+        } else {
+            llaisys::ops::rearrange(V_row, M.V);
+        }
+
 
         // Attention for query at current position against K/V up to pos_idx
         auto K_used = M.cache[l].K->slice(0, 0, pos_idx + 1); // [pos_idx+1, nkvh, dh]
@@ -311,7 +330,7 @@ llaisysQwen2ModelInfer(LlaisysQwen2Model *model,
             break;
         }
     }
-    std::cerr << "[qwen2] layer "  << " done\n";
+    
 
     // Compute next id using the last token and existing KV
     if (next_id == -1) {
